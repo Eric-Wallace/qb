@@ -16,7 +16,7 @@ from qanta.spark import create_spark_context
 from qanta.config import conf
 from qanta import qlogging
 
-
+import numpy as np
 log = qlogging.get(__name__)
 connections.create_connection(hosts=['localhost'])
 INDEX_NAME = 'qb'
@@ -150,20 +150,15 @@ class ElasticSearchGuesser(AbstractGuesser):
         self.normalize_score_by_length = guesser_conf['normalize_score_by_length']
         self.qb_boost = guesser_conf['qb_boost']
         self.wiki_boost = guesser_conf['wiki_boost']
+        self.kuro_trial_id = None
 
     def qb_dataset(self):
         return QuizBowlDataset(guesser_train=True)
 
     def parameters(self):
-        return {
-            'n_cores': self.n_cores,
-            'use_wiki': self.use_wiki,
-            'use_qb': self.use_qb,
-            'many_docs': self.many_docs,
-            'normalize_score_by_length': self.normalize_score_by_length,
-            'qb_boost': self.qb_boost,
-            'wiki_boost': self.wiki_boost
-        }
+        params = conf['guessers']['ElasticSearch'].copy()
+        params['kuro_trial_id'] = self.kuro_trial_id
+        return params
 
     def train(self, training_data):
         if self.many_docs:
@@ -191,6 +186,22 @@ class ElasticSearchGuesser(AbstractGuesser):
                 use_wiki=self.use_wiki
             )
 
+        try:
+            if bool(os.environ.get('KURO_DISABLE', False)):
+                raise ModuleNotFoundError
+            import socket
+            from kuro import Worker
+            worker = Worker(socket.gethostname())
+            experiment = worker.experiment(
+                'guesser', 'ElasticSearch', hyper_parameters=conf['guessers']['ElasticSearch'],
+                n_trials=5
+            )
+            trial = experiment.trial()
+            if trial is not None:
+                self.kuro_trial_id = trial.id
+        except ModuleNotFoundError:
+            trial = None
+
     def guess(self, questions: List[QuestionText], max_n_guesses: Optional[int]):
         def es_search(query):
                 return es_index.search(query, max_n_guesses,
@@ -198,8 +209,11 @@ class ElasticSearchGuesser(AbstractGuesser):
                                        wiki_boost=self.wiki_boost, qb_boost=self.qb_boost)
 
         if len(questions) > 1:
-            sc = create_spark_context(configs=[('spark.executor.cores', self.n_cores), ('spark.executor.memory', '20g')])
-            return sc.parallelize(questions, 16 * self.n_cores).map(es_search).collect()
+            returnVal = []            
+            for question in questions:
+                returnVal.append(es_search(question))
+            return returnVal
+
         elif len(questions) == 1:
             return [es_search(questions[0])]
         else:
@@ -234,28 +248,86 @@ class ElasticSearchGuesser(AbstractGuesser):
 
         app = Flask(__name__)
 
-        @app.route('/api/answer_question', methods=['POST'])
+        @app.route('/api/interface_answer_question', methods=['POST'])
         def answer_question():
             text = request.form['text']
-            guess, score = self.guess([text], 1)[0][0]
-            return jsonify({'guess': guess, 'score': float(score)})
+            answer = request.form['answer']
+            answer = answer.replace(" ", "_").lower()
+            guesses = self.guess([text], 20)[0]
 
-        @app.route('/api/get_highlights', methods=['POST'])
+            score_fn = []
+            sum_normalize = 0.0
+            for (g,s) in guesses:
+                exp = np.exp(3*float(s))
+                score_fn.append(exp)
+                sum_normalize += exp
+            for index, (g,s) in enumerate(guesses):
+                guesses[index] = (g, score_fn[index] / sum_normalize)
+
+            guess = []
+            score = []
+            answer_found = False
+            num = 0
+            for index, (g,s) in enumerate(guesses):
+                if index >= 5:
+                    break
+                guess.append(g)
+                score.append(float(s))
+            for gue in guess:
+                if (gue.lower() == answer.lower()):
+                    answer_found = True
+                    num = -1
+            if (not answer_found):
+                for index, (g,s) in enumerate(guesses):
+                    if (g.lower() == answer.lower()):
+                        guess.append(g)
+                        score.append(float(s))
+                        num = index + 1
+            if (num == 0):
+                print("num was 0")
+                if (request.form['bell'] == 'true'):
+                    return "Num0"
+            guess = [g.replace("_"," ") for g in guess]
+            return jsonify({'guess': guess, 'score': score, 'num': num})
+
+        @app.route('/api/interface_get_highlights', methods=['POST'])
         def get_highlights():
             wiki_field = 'wiki_content'
             qb_field = 'qb_content'
             text = request.form['text']
-            s = Search(index='qb')[0:10].query(
+            s = Search(index='qb')[0:20].query(
                 'multi_match', query=text, fields=[wiki_field, qb_field])
             s = s.highlight(wiki_field).highlight(qb_field)
             results = list(s.execute())
-
             if len(results) == 0:
                 highlights = {'wiki': [''],
                               'qb': [''],
                               'guess': ''}
             else:
-                guess = results[0] # take the best answer
+                guessForEvidence = request.form['guessForEvidence']
+                guessForEvidence = guessForEvidence.split("style=\"color:blue\">")[1].split("</a>")[0].lower()
+                
+                guess = None
+                for index, item in enumerate(results):
+                    if item.page.lower().replace("_", " ")[0:25]  == guessForEvidence:
+                        guess = results[index]
+                        break
+                if guess == None:
+                    print("expanding search")
+                    s = Search(index='qb')[0:80].query(
+                        'multi_match', query=text, fields=[wiki_field, qb_field])
+                    s = s.highlight(wiki_field).highlight(qb_field)
+                    results = list(s.execute()) 
+                    for index, item in enumerate(results):
+                        if item.page.lower().replace("_", " ")[0:25]  == guessForEvidence:
+                            guess = results[index]
+                            break
+                    if guess == None:
+                        highlights = {'wiki': [''],
+                                  'qb': [''],
+                                  'guess': ''}
+                        return jsonify(highlights)
+ 
                 _highlights = guess.meta.highlight 
                 try:
                     wiki_content = list(_highlights.wiki_content)
@@ -271,5 +343,12 @@ class ElasticSearchGuesser(AbstractGuesser):
                               'qb': qb_content,
                               'guess': guess.page}
             return jsonify(highlights)
-
+        
         app.run(host=host, port=port, debug=debug)
+
+
+from PyDictionary import PyDictionary
+from nltk.corpus import wordnet
+
+dictionary = PyDictionary()
+

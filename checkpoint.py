@@ -79,14 +79,14 @@ class S3:
             yield f['Prefix'].split('/')[1]
 
     def create_run(self, date):
-        if not os.path.exists('/tmp/qb'):
-            os.makedirs('/tmp/qb')
+        if not os.path.exists('./tmp/qb'):
+            os.makedirs('./tmp/qb')
 
-        with open('/tmp/qb/run_id', 'w') as f:
+        with open('./tmp/qb/run_id', 'w') as f:
             f.write(date)
 
         self.s3.meta.client.upload_file(
-            '/tmp/qb/run_id',
+            './tmp/qb/run_id',
             self.bucket,
             '{}/{}/run_id'.format(self.namespace, date)
         )
@@ -131,8 +131,8 @@ def compile_targets(targets):
 @click.option('--namespace', help='Namespace within bucket to checkpoint and restore from')
 @click.pass_context
 def cli(ctx, bucket, namespace):
-    if not os.path.exists('/tmp/qb'):
-        os.makedirs('/tmp/qb')
+    if not os.path.exists('./tmp/qb'):
+        os.makedirs('./tmp/qb')
 
     ctx.obj['s3'] = S3(
         fetch(bucket, 'QB_AWS_S3_BUCKET'),
@@ -180,14 +180,14 @@ def save(ctx, date, targets):
 
     for t in compile_targets(targets):
         name = parse.quote_plus(t)
-        shell('tar cvf - {target} | lz4 > /tmp/qb/{name}.tar.lz4'.format(target=t, name=name))
-        shell('aws s3 cp /tmp/qb/{name}.tar.lz4 s3://{bucket}/{namespace}/{date}/{name}'.format(
+        shell('tar cvf - {target} | lz4 > ./tmp/qb/{name}.tar.lz4'.format(target=t, name=name))
+        shell('aws s3 cp ./tmp/qb/{name}.tar.lz4 s3://{bucket}/{namespace}/{date}/{name}'.format(
             name=name,
             bucket=s3.bucket,
             namespace=s3.namespace,
             date=date
         ))
-        shell('rm /tmp/qb/{name}.tar.lz4'.format(name=name))
+        shell('rm ./tmp/qb/{name}.tar.lz4'.format(name=name))
 
 
 @cli.command()
@@ -201,14 +201,14 @@ def restore(ctx, date, targets):
 
     for t in compile_targets(targets):
         name = parse.quote_plus(t)
-        shell('aws s3 cp s3://{bucket}/{namespace}/{date}/{name} /tmp/qb/{name}.tar.lz4'.format(
+        shell('aws s3 cp s3://{bucket}/{namespace}/{date}/{name} ./tmp/qb/{name}.tar.lz4'.format(
             name=name,
             bucket=s3.bucket,
             namespace=s3.namespace,
             date=date
         ))
-        shell('lz4 -d /tmp/qb/{name}.tar.lz4 | tar -x -C .'.format(name=name))
-        shell('rm /tmp/qb/{name}.tar.lz4'.format(name=name))
+        shell('lz4 -d ./tmp/qb/{name}.tar.lz4 | tar -x -C .'.format(name=name))
+        shell('rm ./tmp/qb/{name}.tar.lz4'.format(name=name))
 
 if __name__ == '__main__':
     cli(obj={})
